@@ -1,142 +1,300 @@
-import httpx
+"""
+Главный модуль tg_auto_news
+
+Новая модульная архитектура с улучшенной структурой и документацией.
+"""
+
 import asyncio
 import logging
-from collections import deque
+from typing import List
+
+# Импорты конфигурации
+from config import Settings, ChannelConfig, ParserConfig
+
+# Импорты утилит
+from utils import (
+    setup_logger, 
+    HTTPClient, 
+    MessageSender, 
+    DeduplicationManager, 
+    DateChecker,
+    ErrorCallback
+)
+
+# Импорты парсеров
+from parsers import TelegramParser, RSSParser
+from parsers.html_parsers import BCSParser
+
+# Импорты для обратной совместимости
 from telethon import TelegramClient
 
-from telegram_parser import telegram_parser
-from rss_parser import rss_parser
-from utils import create_logger, get_history, send_error_message
-from config import api_id, api_hash, gazp_chat_id, bot_token
 
-
-###########################
-# Можно добавить телеграм канал, rss ссылку или изменить фильтр новостей
-
-telegram_channels = {
-    1099860397: 'https://moscowach',
-    1428717522: 'https://t.me/gazprom',
-    # 1001029560: 'https://t.me/bcs_express',
+class NewsBot:
+    """
+    Главный класс бота для парсинга новостей
     
-}
-
-rss_channels = {
-    'www.rbc.ru': 'https://rssexport.rbc.ru/rbcnews/news/30/full.rss',
-}
-
-
-def check_pattern_func(text):
-    '''Вибирай только посты или статьи про газпром или газ'''
-    words = text.lower().split()
-
-    key_words = [
-        'газп',     # газпром
-        'газо',     # газопровод, газофикация...
-        'поток',    # сервеный поток, северный поток 2, южный поток
-        'спг',      # спг - сжиженный природный газ
-        'gazp',
-    ]
-
-    for word in words:
-        if 'газ' in word and len(word) < 6:  # газ, газу, газом, газа
-            return True
-
-        for key in key_words:
-            if key in word:
-                return True
-
-    return False
-
-
-###########################
-# Если у парсеров много ошибок или появляются повторные новости
-
-# 50 первых символов от поста - это ключ для поиска повторных постов
-n_test_chars = 50
-
-# Количество уже опубликованных постов, чтобы их не повторять
-amount_messages = 50
-
-# Очередь уже опубликованных постов
-posted_q = deque(maxlen=amount_messages)
-
-# +/- интервал между запросами у rss и кастомного парсеров в секундах
-timeout = 2
-
-###########################
-
-
-logger = create_logger('gazp')
-logger.info('Start...')
-
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
-tele_logger = create_logger('telethon', level=logging.ERROR)
-
-bot = TelegramClient('bot', api_id, api_hash,
-                     base_logger=tele_logger, loop=loop)
-bot.start(bot_token=bot_token)
-
-
-async def send_message_func(text):
-    '''Отправляет посты в канал через бот'''
-    await bot.send_message(entity=gazp_chat_id,
-                           parse_mode='html', link_preview=False, message=text)
-
-    logger.info(text)
-
-
-# Телеграм парсер
-client = telegram_parser('gazp', api_id, api_hash, telegram_channels, posted_q,
-                         n_test_chars, check_pattern_func, send_message_func,
-                         tele_logger, loop)
-print()
-
-# Список из уже опубликованных постов, чтобы их не дублировать
-history = loop.run_until_complete(get_history(client, gazp_chat_id,
-                                              n_test_chars, amount_messages))
-
-posted_q.extend(history)
-
-httpx_client = httpx.AsyncClient()
-
-# Добавляй в текущий event_loop rss парсеры
-for source, rss_link in rss_channels.items():
-
-    # https://docs.python-guide.org/writing/gotchas/#late-binding-closures
-    async def wrapper(source, rss_link):
+    Управляет всеми парсерами и обеспечивает их координацию.
+    """
+    
+    def __init__(self):
+        """Инициализация бота"""
+        # Загружаем конфигурацию
+        self.settings = Settings()
+        self.channel_config = ChannelConfig()
+        self.parser_config = ParserConfig()
+        
+        # Настраиваем логирование
+        self.logger = setup_logger('news_bot', self.settings.log_level)
+        self.telethon_logger = setup_logger('telethon', self.settings.telethon_log_level)
+        
+        # Создаем компоненты
+        self.http_client = HTTPClient(
+            connect_timeout=self.settings.http_connect_timeout,
+            read_timeout=self.settings.http_read_timeout,
+            write_timeout=self.settings.http_write_timeout,
+            pool_timeout=self.settings.http_pool_timeout,
+            retries=self.settings.http_retries,
+            verify_ssl=self.settings.http_verify_ssl
+        )
+        
+        self.date_checker = DateChecker(logger=self.logger)
+        self.deduplication_manager = DeduplicationManager(
+            max_size=self.settings.duplicate_check_messages,
+            check_chars=self.settings.duplicate_check_chars,
+            logger=self.logger
+        )
+        
+        # Telegram клиенты
+        self.bot_client: TelegramClient = None
+        self.message_sender: MessageSender = None
+        self.error_callback: ErrorCallback = None
+        
+        # Парсеры
+        self.parsers: List = []
+        
+        # Состояние
+        self._running = False
+    
+    async def initialize(self):
+        """Инициализация бота"""
         try:
-            await rss_parser(httpx_client, source, rss_link, posted_q,
-                             n_test_chars, timeout, check_pattern_func,
-                             send_message_func, logger)
+            self.logger.info("Инициализация бота...")
+            
+            # Создаем HTTP клиент
+            await self.http_client.get_client()
+            
+            # Создаем Telegram бот клиент
+            self.bot_client = TelegramClient(
+                self.settings.bot_session_name,
+                self.settings.api_id,
+                self.settings.api_hash,
+                base_logger=self.telethon_logger
+            )
+            await self.bot_client.start(bot_token=self.settings.bot_token)
+            
+            # Создаем отправитель сообщений
+            self.message_sender = MessageSender(
+                bot_client=self.bot_client,
+                target_chat_id=self.settings.target_chat_id,
+                logger=self.logger
+            )
+            
+            # Создаем обработчик ошибок
+            self.error_callback = ErrorCallback(self.message_sender)
+            
+            # Загружаем историю для предотвращения дубликатов
+            await self._load_history()
+            
+            # Создаем парсеры
+            await self._create_parsers()
+            
+            self.logger.info("Бот успешно инициализирован")
+            
         except Exception as e:
-            message = f'&#9888; ERROR: {source} parser is down! \n{e}'
-            await send_error_message(message, bot_token, gazp_chat_id, logger)
+            self.logger.error(f"Ошибка инициализации бота: {e}")
+            raise
+    
+    async def _load_history(self):
+        """Загружает историю сообщений для предотвращения дубликатов"""
+        try:
+            # Создаем временный клиент для загрузки истории
+            temp_client = TelegramClient(
+                self.settings.telegram_session_name,
+                self.settings.api_id,
+                self.settings.api_hash
+            )
+            await temp_client.start()
+            
+            # Загружаем историю
+            await self.deduplication_manager.load_history_from_telegram(
+                client=temp_client,
+                chat_id=self.settings.target_chat_id,
+                amount_messages=self.settings.duplicate_check_messages
+            )
+            
+            await temp_client.disconnect()
+            
+            self.logger.info("История сообщений загружена")
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка загрузки истории: {e}")
+    
+    async def _create_parsers(self):
+        """Создает все парсеры"""
+        try:
+            # Telegram парсер
+            if self.parser_config.is_parser_enabled('telegram'):
+                telegram_channels = self.channel_config.get_enabled_telegram_channels()
+                if telegram_channels:
+                    telegram_parser = TelegramParser(
+                        channels=telegram_channels,
+                        settings=self.settings,
+                        message_sender=self.message_sender,
+                        deduplication_manager=self.deduplication_manager,
+                        date_checker=self.date_checker,
+                        logger=self.logger,
+                        error_callback=self.error_callback
+                    )
+                    self.parsers.append(telegram_parser)
+                    self.logger.info(f"Создан Telegram парсер для {len(telegram_channels)} каналов")
+            
+            # RSS парсер
+            if self.parser_config.is_parser_enabled('rss'):
+                rss_channels = self.channel_config.get_enabled_rss_channels()
+                if rss_channels:
+                    http_client = await self.http_client.get_client()
+                    rss_parser = RSSParser(
+                        channels=rss_channels,
+                        settings=self.settings,
+                        http_client=http_client,
+                        message_sender=self.message_sender,
+                        deduplication_manager=self.deduplication_manager,
+                        date_checker=self.date_checker,
+                        logger=self.logger,
+                        error_callback=self.error_callback
+                    )
+                    self.parsers.append(rss_parser)
+                    self.logger.info(f"Создан RSS парсер для {len(rss_channels)} каналов")
+            
+            # HTML парсеры
+            if self.parser_config.is_parser_enabled('html'):
+                html_channels = self.channel_config.get_enabled_html_channels()
+                for channel_name, channel in html_channels.items():
+                    if channel.parser_class == 'BCSParser':
+                        http_client = await self.http_client.get_client()
+                        bcs_parser = BCSParser(
+                            settings=self.settings,
+                            http_client=http_client,
+                            message_sender=self.message_sender,
+                            deduplication_manager=self.deduplication_manager,
+                            date_checker=self.date_checker,
+                            logger=self.logger,
+                            error_callback=self.error_callback
+                        )
+                        self.parsers.append(bcs_parser)
+                        self.logger.info(f"Создан BCS парсер")
+            
+            self.logger.info(f"Создано {len(self.parsers)} парсеров")
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка создания парсеров: {e}")
+            raise
+    
+    async def start(self):
+        """Запускает бота"""
+        try:
+            self.logger.info("Запуск бота...")
+            
+            await self.initialize()
+            
+            self._running = True
+            
+            # Запускаем все парсеры
+            tasks = []
+            for parser in self.parsers:
+                task = asyncio.create_task(parser.start())
+                tasks.append(task)
+            
+            if not tasks:
+                self.logger.warning("Нет активных парсеров для запуска")
+                return
+            
+            self.logger.info(f"Запущено {len(tasks)} парсеров")
+            
+            # Ждем завершения всех задач
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка запуска бота: {e}")
+            
+            # Отправляем критическую ошибку
+            if self.message_sender:
+                error_msg = (
+                    f"🚨 <b>Critical System Error</b>\n\n"
+                    f"❌ <b>Component:</b> Main Application\n"
+                    f"❌ <b>Error:</b> {type(e).__name__}\n"
+                    f"📝 <b>Details:</b> {str(e)[:200]}"
+                )
+                await self.message_sender.send_error_message(error_msg)
+            
+            raise
+    
+    async def stop(self):
+        """Останавливает бота"""
+        try:
+            self.logger.info("Остановка бота...")
+            
+            self._running = False
+            
+            # Останавливаем все парсеры
+            for parser in self.parsers:
+                try:
+                    await parser.stop()
+                except Exception as e:
+                    self.logger.error(f"Ошибка остановки парсера {parser.name}: {e}")
+            
+            # Закрываем HTTP клиент
+            await self.http_client.close()
+            
+            # Закрываем Telegram клиент
+            if self.bot_client:
+                await self.bot_client.disconnect()
+            
+            self.logger.info("Бот остановлен")
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка остановки бота: {e}")
+    
+    def get_status(self) -> dict:
+        """
+        Возвращает статус бота
+        
+        Returns:
+            Словарь со статусом всех компонентов
+        """
+        return {
+            'running': self._running,
+            'parsers_count': len(self.parsers),
+            'parsers_status': [parser.get_status() for parser in self.parsers],
+            'channels_count': self.channel_config.get_enabled_channels_count(),
+            'posted_count': self.deduplication_manager.get_posted_count()
+        }
 
-    loop.create_task(wrapper(source, rss_link))
+
+async def main():
+    """Главная функция"""
+    bot = NewsBot()
+    
+    try:
+        await bot.start()
+    except KeyboardInterrupt:
+        print("\nПолучен сигнал остановки...")
+    except Exception as e:
+        print(f"Критическая ошибка: {e}")
+    finally:
+        await bot.stop()
 
 
-# Добавляй в текущий event_loop кастомный парсер
-# async def bcs_wrapper():
-#     try:
-#         await bcs_parser(httpx_client, posted_q, n_test_chars, timeout,
-#                          check_pattern_func, send_message_func, logger)
-#     except Exception as e:
-#         message = f'&#9888; ERROR: bcs-express.ru parser is down! \n{e}'
-#         await send_error_message(message, bot_token, gazp_chat_id, logger)
-
-# loop.create_task(bcs_wrapper())
-
-
-try:
-    # Запускает все парсеры
-    client.run_until_disconnected()
-
-except Exception as e:
-    message = f'&#9888; ERROR: telegram parser (all parsers) is down! \n{e}'
-    loop.run_until_complete(send_error_message(message, bot_token,
-                                               gazp_chat_id, logger))
-finally:
-    loop.run_until_complete(httpx_client.aclose())
-    loop.close()
+if __name__ == "__main__":
+    # Запускаем бота
+    asyncio.run(main())
